@@ -15,11 +15,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
-#[cfg(unix)]
-use std::time::SystemTime;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use tauri::webview::NewWindowResponse;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2710,11 +2708,53 @@ pub fn parse_dsh_theme_preference(yaml_text: &str) -> String {
     "system".into()
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilePlugin {
     pub name: String,
     pub version: String,
+    pub installed_at: Option<String>,
+}
+
+fn system_time_to_rfc3339(time: SystemTime) -> String {
+    let dt: DateTime<Utc> = time.into();
+    dt.to_rfc3339()
+}
+
+/// 读取插件的安装时间（ISO 8601 字符串）。
+/// 优先从 Profile 的 node_modules 下探测插件目录或符号链接的元数据。
+fn read_plugin_installed_at(profile_dir: &Path, plugin_name: &str) -> Option<String> {
+    let mut path = profile_dir.join("node_modules");
+    for part in plugin_name.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            continue;
+        }
+        path.push(part);
+    }
+
+    // 若是符号链接，优先读取符号链接本身的修改/创建时间
+    if let Ok(symlink_meta) = fs::symlink_metadata(&path) {
+        if symlink_meta.file_type().is_symlink() {
+            if let Ok(time) = symlink_meta.created().or_else(|_| symlink_meta.modified()) {
+                return Some(system_time_to_rfc3339(time));
+            }
+        }
+    }
+
+    // 否则读取目录本身的创建/修改时间，若失败回退读取其 package.json 的时间
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Ok(time) = meta.created().or_else(|_| meta.modified()) {
+            return Some(system_time_to_rfc3339(time));
+        }
+    }
+
+    if let Ok(pkg_meta) = fs::metadata(path.join("package.json")) {
+        if let Ok(time) = pkg_meta.created().or_else(|_| pkg_meta.modified()) {
+            return Some(system_time_to_rfc3339(time));
+        }
+    }
+
+    None
 }
 
 /// 校验插件名：允许 npm 包名（含一个 `@scope/` 前缀），拒绝路径穿越与命令元字符。
@@ -2745,6 +2785,19 @@ fn validate_plugin_name(name: &str) -> Result<(), String> {
 /// 读取 Profile 已安装插件（package.json dependencies，与 DSH 插件安装机制一致）。
 pub fn read_profile_plugins(profile: &str) -> Result<Vec<ProfilePlugin>, String> {
     let dir = profile_directory(profile).ok_or_else(|| "无法定位 Profile 目录".to_string())?;
+    read_profile_plugins_from_dir(&dir)
+}
+
+pub(crate) fn sort_profile_plugins(a: &ProfilePlugin, b: &ProfilePlugin) -> std::cmp::Ordering {
+    match (&a.installed_at, &b.installed_at) {
+        (Some(ta), Some(tb)) => tb.cmp(ta).then_with(|| a.name.cmp(&b.name)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
+    }
+}
+
+pub fn read_profile_plugins_from_dir(dir: &Path) -> Result<Vec<ProfilePlugin>, String> {
     let text = fs::read_to_string(dir.join("package.json"))
         .map_err(|_| "Profile 尚未初始化（未找到 package.json），请先启动一次 DSH".to_string())?;
     let value: serde_json::Value =
@@ -2752,13 +2805,15 @@ pub fn read_profile_plugins(profile: &str) -> Result<Vec<ProfilePlugin>, String>
     let mut plugins = Vec::new();
     if let Some(deps) = value.get("dependencies").and_then(|deps| deps.as_object()) {
         for (name, spec) in deps {
+            let installed_at = read_plugin_installed_at(dir, name);
             plugins.push(ProfilePlugin {
                 name: name.clone(),
                 version: spec.as_str().unwrap_or_default().to_string(),
+                installed_at,
             });
         }
     }
-    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    plugins.sort_by(sort_profile_plugins);
     Ok(plugins)
 }
 
@@ -2861,6 +2916,8 @@ fn wait_for_output(mut child: Child, display: String, timeout: Duration) -> Resu
 /// 在指定目录执行 pnpm 命令（带超时），返回合并后的输出。
 fn run_pnpm(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut command = pnpm_command(args);
+    let (envs, _) = launcher_environment();
+    command.envs(envs);
     command.current_dir(dir).stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_command_process_group(&mut command);
     let child = command
@@ -3527,6 +3584,81 @@ mod tests {
         assert!(validate_plugin_name("pkg name").is_err());
         assert!(validate_plugin_name("@scope/").is_err());
         assert!(validate_plugin_name("/pkg").is_err());
+    }
+
+    #[test]
+    fn profile_plugins_sort_order_descending_by_installed_at() {
+        let mut plugins = vec![
+            ProfilePlugin {
+                name: "plugin-early".into(),
+                version: "1.0.0".into(),
+                installed_at: Some("2026-01-01T10:00:00Z".into()),
+            },
+            ProfilePlugin {
+                name: "plugin-no-time-z".into(),
+                version: "1.0.0".into(),
+                installed_at: None,
+            },
+            ProfilePlugin {
+                name: "plugin-latest".into(),
+                version: "1.0.0".into(),
+                installed_at: Some("2026-03-01T10:00:00Z".into()),
+            },
+            ProfilePlugin {
+                name: "plugin-middle".into(),
+                version: "1.0.0".into(),
+                installed_at: Some("2026-02-01T10:00:00Z".into()),
+            },
+            ProfilePlugin {
+                name: "plugin-no-time-a".into(),
+                version: "1.0.0".into(),
+                installed_at: None,
+            },
+        ];
+        plugins.sort_by(sort_profile_plugins);
+        assert_eq!(plugins[0].name, "plugin-latest");
+        assert_eq!(plugins[1].name, "plugin-middle");
+        assert_eq!(plugins[2].name, "plugin-early");
+        assert_eq!(plugins[3].name, "plugin-no-time-a");
+        assert_eq!(plugins[4].name, "plugin-no-time-z");
+    }
+
+    #[test]
+    fn read_profile_plugins_extracts_installed_at_and_sorts() {
+        let stamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("dsh-desktop-plugins-{}-{stamp}", std::process::id()));
+        let node_modules = root.join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+
+        let p1 = node_modules.join("b-plugin");
+        let p2 = node_modules.join("@scope").join("a-plugin");
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+
+        let pkg_json = r#"{
+            "name": "profile-test",
+            "dependencies": {
+                "b-plugin": "^1.0.0",
+                "@scope/a-plugin": "^2.1.0",
+                "missing-plugin": "^0.0.1"
+            }
+        }"#;
+        fs::write(root.join("package.json"), pkg_json).unwrap();
+
+        let list = read_profile_plugins_from_dir(&root).expect("读取应成功");
+        assert_eq!(list.len(), 3);
+        // 有时间的排在前面，无时间的排在最后；如果时间相同按名称升序
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"@scope/a-plugin"));
+        assert!(names.contains(&"b-plugin"));
+        assert_eq!(list[2].name, "missing-plugin");
+        assert_eq!(list[2].version, "^0.0.1");
+        assert_eq!(list[2].installed_at, None);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

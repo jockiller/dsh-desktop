@@ -15,6 +15,7 @@ import {
   Power,
   RefreshCw,
   RotateCw,
+  Search,
   Settings,
   Trash2,
   TriangleAlert,
@@ -102,6 +103,23 @@ interface ManagedProgress {
 interface ProfilePlugin {
   name: string;
   version: string;
+  installedAt?: string | null;
+}
+
+function formatPluginDate(dateStr: string): string {
+  try {
+    const d = new Date(dateStr);
+    if (Number.isNaN(d.getTime())) return dateStr;
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const year = d.getFullYear();
+    const month = pad(d.getMonth() + 1);
+    const day = pad(d.getDate());
+    const hours = pad(d.getHours());
+    const minutes = pad(d.getMinutes());
+    return `${year}-${month}-${day} ${hours}:${minutes}`;
+  } catch {
+    return dateStr;
+  }
 }
 
 // 与后端 ServiceStatus 默认值一致；展示时经 translateBackendMessage 按当前语言渲染
@@ -229,6 +247,7 @@ export default function App() {
   const [plugins, setPlugins] = useState<ProfilePlugin[]>([]);
   const [pluginsLoading, setPluginsLoading] = useState(false);
   const [pluginsError, setPluginsError] = useState<string | null>(null);
+  const [pluginsSearch, setPluginsSearch] = useState("");
   const [uninstallingName, setUninstallingName] = useState<string | null>(null);
   const [cleanBusy, setCleanBusy] = useState(false);
   const logEnd = useRef<HTMLDivElement>(null);
@@ -245,6 +264,26 @@ export default function App() {
   const versionCheckSeq = useRef(0);
   const appVersionCheckSeq = useRef(0);
   const autoStartTriggered = useRef(false);
+
+  const filteredPlugins = useMemo(() => {
+    const sorted = [...plugins].sort((a, b) => {
+      if (a.installedAt && b.installedAt) {
+        const timeDiff = new Date(b.installedAt).getTime() - new Date(a.installedAt).getTime();
+        if (!Number.isNaN(timeDiff) && timeDiff !== 0) return timeDiff;
+      } else if (a.installedAt && !b.installedAt) {
+        return -1;
+      } else if (!a.installedAt && b.installedAt) {
+        return 1;
+      }
+      return a.name.localeCompare(b.name);
+    });
+    const term = pluginsSearch.trim().toLowerCase();
+    if (!term) return sorted;
+    return sorted.filter((plugin) =>
+      plugin.name.toLowerCase().includes(term) ||
+      (plugin.version && plugin.version.toLowerCase().includes(term))
+    );
+  }, [plugins, pluginsSearch]);
 
   const isMac = platform === "macos";
 
@@ -865,6 +904,7 @@ export default function App() {
   async function openPluginsDialog(button: HTMLButtonElement) {
     button.blur();
     pluginsTriggerRef.current = button;
+    setPluginsSearch("");
     setPluginsError(null);
     setPluginsDialogOpen(true);
     await refreshPlugins();
@@ -1412,17 +1452,49 @@ export default function App() {
             <header><h2 id="plugins-dialog-title">{t.pluginsDialogTitle}</h2></header>
             <div className="install-dialog-body">
               <p className="plugins-hint">{t.pluginsDialogHint}</p>
-              {pluginsLoading && <p className="dsh-update-warning" role="status">{t.pluginsLoading}</p>}
-              {pluginsError && <p className="install-dialog-error" role="alert">{translateBackendMessage(pluginsError, lang)}</p>}
-              {!pluginsLoading && !pluginsError && plugins.length === 0 && (
-                <p className="app-update-success" role="status">{t.pluginsEmpty}</p>
-              )}
+              <div className="plugins-search-bar">
+                <Search size={13} className="plugins-search-icon" aria-hidden="true" />
+                <input
+                  type="text"
+                  className="plugins-search-input"
+                  placeholder={t.pluginsSearchPlaceholder}
+                  value={pluginsSearch}
+                  onChange={(event) => setPluginsSearch(event.target.value)}
+                  aria-label={t.pluginsSearchPlaceholder}
+                />
+                {pluginsSearch && (
+                  <button
+                    type="button"
+                    className="plugins-search-clear"
+                    title={t.pluginsSearchClear}
+                    aria-label={t.pluginsSearchClear}
+                    onClick={() => setPluginsSearch("")}
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
               <div className="plugins-list">
-                {plugins.map((plugin) => (
+                {pluginsLoading && <p className="dsh-update-warning" role="status">{t.pluginsLoading}</p>}
+                {pluginsError && <p className="install-dialog-error" role="alert">{translateBackendMessage(pluginsError, lang)}</p>}
+                {!pluginsLoading && !pluginsError && plugins.length === 0 && (
+                  <p className="app-update-success" role="status">{t.pluginsEmpty}</p>
+                )}
+                {!pluginsLoading && !pluginsError && plugins.length > 0 && filteredPlugins.length === 0 && (
+                  <p className="plugins-search-empty" role="status">{t.pluginsSearchEmpty}</p>
+                )}
+                {!pluginsLoading && !pluginsError && filteredPlugins.map((plugin) => (
                   <div className="plugin-row" key={plugin.name}>
                     <div className="plugin-meta">
                       <strong>{plugin.name}</strong>
-                      <small>{plugin.version}</small>
+                      <div className="plugin-details">
+                        <small className="plugin-version">{plugin.version}</small>
+                        {plugin.installedAt && (
+                          <small className="plugin-installed-at" title={`${t.pluginInstalledAt}: ${formatPluginDate(plugin.installedAt)}`}>
+                            {t.pluginInstalledAt} {formatPluginDate(plugin.installedAt)}
+                          </small>
+                        )}
+                      </div>
                     </div>
                     <button
                       type="button"

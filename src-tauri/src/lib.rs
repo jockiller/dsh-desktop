@@ -469,7 +469,8 @@ pub fn run() {
                 main_builder = main_builder
                     .title_bar_style(tauri::TitleBarStyle::Overlay)
                     .hidden_title(true)
-                    .traffic_light_position(tauri::LogicalPosition::new(16.0, 13.0));
+                    .traffic_light_position(tauri::LogicalPosition::new(16.0, 13.0))
+                    .initialization_script(service::MACOS_STALE_RELEASE_GUARD_SCRIPT);
             }
             #[cfg(not(target_os = "macos"))]
             {

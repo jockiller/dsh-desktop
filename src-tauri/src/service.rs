@@ -99,6 +99,139 @@ const DISABLE_BOUNCE_SCRIPT: &str = r#"
 })();
 "#;
 
+/// macOS 触控板轻触释放遗漏保护脚本：
+/// 在 macOS（WebKit/WKWebView）下，开启触控板轻触（Tap to click）或三指拖移时，
+/// 偶尔会出现派发了 mousedown/pointerdown 但抬手后遗漏派发 mouseup/pointerup 的现象，
+/// 导致后续光标移动（此时 buttons === 0）被页面组件误当做“按住拖拽/划选”。
+/// 捕获阶段监听指针移动，若检测到此前处于按下但当前 buttons === 0，
+/// 立即拦截当前陈旧移动事件并合成派发 pointerup 与 mouseup 通知所有层级清理拖拽状态。
+pub(crate) const MACOS_STALE_RELEASE_GUARD_SCRIPT: &str = r#"
+(() => {
+  if (window.__DSH_STALE_RELEASE_GUARD_INSTALLED__) return;
+  window.__DSH_STALE_RELEASE_GUARD_INSTALLED__ = true;
+
+  const isMac = /Macintosh|Mac OS X/i.test(navigator.userAgent) || (navigator.platform && navigator.platform.includes('Mac'));
+  if (!isMac) return;
+
+  let isPressed = false;
+  let activeTarget = null;
+
+  const handlePointerDown = (e) => {
+    // 跟踪鼠标/触控板主按键（左键），排除纯触摸屏手势
+    if (e.button === 0 && e.pointerType !== 'touch') {
+      isPressed = true;
+      activeTarget = e.target;
+    }
+  };
+
+  const handlePointerUp = (e) => {
+    if (e.button === 0 || e.buttons === 0) {
+      isPressed = false;
+      activeTarget = null;
+    }
+  };
+
+  const releaseStalePress = (e) => {
+    if (!isPressed) return;
+    isPressed = false;
+    const target = activeTarget || (e ? e.target : null) || document;
+    activeTarget = null;
+
+    if (e && typeof e.stopImmediatePropagation === 'function') {
+      try {
+        e.stopImmediatePropagation();
+      } catch (_) {}
+    }
+
+    const clientX = e ? e.clientX : 0;
+    const clientY = e ? e.clientY : 0;
+    const screenX = e ? e.screenX : 0;
+    const screenY = e ? e.screenY : 0;
+    const ctrlKey = e ? e.ctrlKey : false;
+    const metaKey = e ? e.metaKey : false;
+    const altKey = e ? e.altKey : false;
+    const shiftKey = e ? e.shiftKey : false;
+
+    // 1. 合成派发 pointerup
+    try {
+      const pointerUpEvt = new PointerEvent('pointerup', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 0,
+        buttons: 0,
+        clientX,
+        clientY,
+        screenX,
+        screenY,
+        pointerId: (e && e.pointerId) || 1,
+        pointerType: (e && e.pointerType) || 'mouse',
+        isPrimary: true,
+        ctrlKey,
+        metaKey,
+        altKey,
+        shiftKey,
+      });
+      target.dispatchEvent(pointerUpEvt);
+    } catch (_) {}
+
+    // 2. 合成派发 mouseup
+    try {
+      const mouseUpEvt = new MouseEvent('mouseup', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 0,
+        buttons: 0,
+        clientX,
+        clientY,
+        screenX,
+        screenY,
+        ctrlKey,
+        metaKey,
+        altKey,
+        shiftKey,
+      });
+      target.dispatchEvent(mouseUpEvt);
+    } catch (_) {}
+  };
+
+  const handlePointerMove = (e) => {
+    // 关键判据：此前记录了按下，但当前光标移动事件物理上按键已全部松开 (buttons === 0)
+    if (isPressed && e.buttons === 0) {
+      releaseStalePress(e);
+    }
+  };
+
+  // 在捕获阶段（useCapture: true）注册，优先拦截并在业务监听器触发前完成修正
+  window.addEventListener('pointerdown', handlePointerDown, true);
+  window.addEventListener('pointerup', handlePointerUp, true);
+  window.addEventListener('pointercancel', handlePointerUp, true);
+  window.addEventListener('pointermove', handlePointerMove, true);
+
+  // 兼容未完全迁移至 PointerEvent 的旧组件的 MouseEvent
+  window.addEventListener('mousedown', (e) => {
+    if (e.button === 0) {
+      isPressed = true;
+      activeTarget = e.target;
+    }
+  }, true);
+  window.addEventListener('mouseup', handlePointerUp, true);
+  window.addEventListener('mousemove', (e) => {
+    if (isPressed && e.buttons === 0) {
+      releaseStalePress(e);
+    }
+  }, true);
+
+  // 窗口失焦、Tab隐藏或原生拖拽结束时重置状态
+  window.addEventListener('blur', () => releaseStalePress(null), true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) releaseStalePress(null);
+  }, true);
+  window.addEventListener('dragend', () => releaseStalePress(null), true);
+})();
+"#;
+
 /// 生成把指定主题写入 DSH 页面的脚本：持久化到 localStorage（下次加载免闪）、
 /// 立即应用并派发主题变更事件（DSH 侧订阅该事件）。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3160,6 +3293,7 @@ fn content_webview_builder(app: &AppHandle, parsed: Url) -> tauri::WebviewBuilde
         .initialization_script(SYSTEM_THEME_SCRIPT)
         .initialization_script(CONTENT_THEME_WATCHER_SCRIPT)
         .initialization_script(DISABLE_BOUNCE_SCRIPT)
+        .initialization_script(MACOS_STALE_RELEASE_GUARD_SCRIPT)
         // 把 DSH 页面的真实 document.title 上报给前端主窗口标题栏展示
         .on_document_title_changed(|webview, title| {
             let app = webview.app_handle();
@@ -3180,6 +3314,7 @@ fn content_webview_builder(app: &AppHandle, parsed: Url) -> tauri::WebviewBuilde
                     let _ = webview.eval(theme_apply_script(&theme));
                 }
                 let _ = webview.eval(DISABLE_BOUNCE_SCRIPT);
+                let _ = webview.eval(MACOS_STALE_RELEASE_GUARD_SCRIPT);
             }
             let _ = app.emit("content-page-load", finished);
         })
@@ -3276,6 +3411,7 @@ fn open_embedded_webview_window(
         .visible(false)
         .initialization_script(SYSTEM_THEME_SCRIPT)
         .initialization_script(DISABLE_BOUNCE_SCRIPT)
+        .initialization_script(MACOS_STALE_RELEASE_GUARD_SCRIPT)
         .build()
         .map_err(|error| format!("打开内置 WebView 失败：{error}"))?;
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.5.2 - 2026-09-06
+
+### 缺陷修复
+
+- **修复 macOS 触控板轻触后卡在按住拖拽/划选状态的问题**：
+  - 在 macOS 平台下，WebKit/WKWebView 在触控板轻触（Tap to click）或开启三指拖移时偶发出现仅派发 `mousedown`/`pointerdown` 但抬手后遗漏 `mouseup`/`pointerup` 的底层缺陷，导致光标移动被页面误判定为持续按住拖拽或文本划选；
+  - 注入 macOS 全局释放守卫脚本（`MACOS_STALE_RELEASE_GUARD_SCRIPT`），在捕获阶段实时跟踪指针移动；一旦检测到此前处于按下但物理按键已全部松开（`e.buttons === 0`），立即拦截该帧移动并向当前目标派发合成的 `pointerup` 与 `mouseup` 事件，通知各层级组件清理拖拽状态机；
+  - 全面覆盖主窗口标题栏、内嵌 DSH 服务子 WebView 以及独立窗口，并在窗口失焦（`blur`）、页面隐藏与系统原生拖拽结束时自动兜底重置。
+
 ## v1.5.1 - 2026-09-06
 
 ### 新增与优化

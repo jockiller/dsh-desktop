@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "1.5.2"
+version = "1.5.3"
 description = "A lightweight desktop app for DSH Web"
 license = "MIT"
 authors = ["DSH Desktop"]

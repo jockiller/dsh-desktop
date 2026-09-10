@@ -3130,6 +3130,85 @@ pub fn run_profile_clean(app: &AppHandle, profile: &str) -> Result<(), String> {
     }
 }
 
+/// 在外部环境中直接执行 npm 全局安装/升级 DSH：
+/// `npm install -g @deepseek-ai/dsh@<version>`
+pub fn install_external_dsh(
+    app: &AppHandle,
+    version: &str,
+) -> Result<String, String> {
+    let target_ver = version.trim();
+    if target_ver.is_empty() {
+        return Err("目标版本不能为空".into());
+    }
+    emit_log(app, "installer", "info", &format!("正在通过 npm 全局安装 @deepseek-ai/dsh@{target_ver}..."));
+
+    #[cfg(windows)]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        suppress_console_window(&mut cmd);
+        cmd.arg("/C").arg(format!("npm install -g @deepseek-ai/dsh@{target_ver}"));
+        cmd
+    };
+
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut cmd = Command::new("npm");
+        cmd.args(["install", "-g", &format!("@deepseek-ai/dsh@{target_ver}")]);
+        cmd
+    };
+
+    let (envs, _) = launcher_environment();
+    command.envs(envs);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_command_process_group(&mut command);
+
+    let child = command
+        .spawn()
+        .map_err(|error| format!("启动 npm 失败，请检查 PATH 中是否包含 npm：{error}"))?;
+
+    let output = wait_for_output(child, format!("npm install -g @deepseek-ai/dsh@{target_ver}"), Duration::from_secs(600))?;
+    if !output.trim().is_empty() {
+        emit_log(app, "installer", "info", output.trim());
+    }
+    emit_log(app, "installer", "info", &format!("@deepseek-ai/dsh@{target_ver} 全局安装完成"));
+    Ok(target_ver.to_string())
+}
+
+/// 在指定 Profile 中安装/更新插件（支持指定版本）：
+/// 调用官方 CLI: `dsh plugin --profile <profile> add <spec>`。
+pub fn install_profile_plugin(
+    app: &AppHandle,
+    profile: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Result<(), String> {
+    validate_plugin_name(name)?;
+    let config = LauncherConfig::load();
+    let dsh_path = resolve_dsh(&config.dsh_path)
+        .ok_or_else(|| "未找到可执行的 dsh，请先在设置中指定 DSH 命令".to_string())?;
+
+    let spec = match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(ver) => format!("{name}@{ver}"),
+        None => name.to_string(),
+    };
+
+    emit_log(app, "plugins", "info", &format!("正在通过 dsh 安装插件 {spec}..."));
+    let args = ["plugin", "--profile", profile, "add", &spec];
+    match run_dsh_cli(&dsh_path, &args, PNPM_INSTALL_TIMEOUT) {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                emit_log(app, "plugins", "info", output.trim());
+            }
+            emit_log(app, "plugins", "info", &format!("插件 {spec} 安装完成"));
+            Ok(())
+        }
+        Err(error) => {
+            emit_log(app, "plugins", "error", &error);
+            Err("通过 dsh 安装插件失败，详见服务日志".into())
+        }
+    }
+}
+
 fn english_launch_action_error(error: &str) -> String {
     for (prefix, translated) in [
         ("无效的 DSH URL：", "Invalid DSH URL: "),

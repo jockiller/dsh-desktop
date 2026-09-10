@@ -71,6 +71,16 @@ struct NpmLatest {
     version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVersionInfo {
+    pub package_name: String,
+    pub latest: Option<String>,
+    pub dist_tags: std::collections::BTreeMap<String, String>,
+    pub versions: Vec<String>,
+    pub release_times: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DshVersionInfo {
@@ -107,6 +117,7 @@ pub fn install_managed(
     app: AppHandle,
     root: PathBuf,
     use_mirror: bool,
+    target_version: Option<String>,
 ) -> Result<ManagedStatus, String> {
     let _guard = OperationGuard::acquire()?;
     validate_install_root(&root)?;
@@ -149,7 +160,10 @@ pub fn install_managed(
         }
         let staged_dsh = staging.join("dsh-runtime");
         emit_progress(&app, "install", "正在安装 DSH...", Some(70));
-        let expected_dsh_version = fetch_latest_dsh(use_mirror)?;
+        let expected_dsh_version = match target_version.filter(|v| !v.trim().is_empty()) {
+            Some(v) => v.trim().to_string(),
+            None => fetch_latest_dsh(use_mirror)?,
+        };
         npm_install(
             &app,
             &extracted_node,
@@ -190,7 +204,11 @@ pub fn install_managed(
     result
 }
 
-pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, String> {
+pub fn upgrade_managed(
+    app: AppHandle,
+    root: PathBuf,
+    target_version: Option<String>,
+) -> Result<ManagedStatus, String> {
     let _guard = OperationGuard::acquire()?;
     let mut marker = read_marker(&root)?;
     let staging = root.join(".dsh-upgrade-staging");
@@ -206,7 +224,10 @@ pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
     let _ = fs::remove_dir_all(&failed);
     emit_progress(&app, "upgrade", "服务已停止，正在升级 DSH...", Some(20));
     let result = (|| {
-        let expected_dsh_version = fetch_latest_dsh(marker.use_mirror)?;
+        let expected_dsh_version = match target_version.filter(|v| !v.trim().is_empty()) {
+            Some(v) => v.trim().to_string(),
+            None => fetch_latest_dsh(marker.use_mirror)?,
+        };
         npm_install(
             &app,
             &root.join("node"),
@@ -308,6 +329,83 @@ pub fn check_dsh_version(current_version: &str) -> Result<DshVersionInfo, String
         latest_version,
         latest_notes,
         update_available,
+    })
+}
+
+pub fn fetch_package_versions(
+    package_name: &str,
+    use_mirror: bool,
+) -> Result<PackageVersionInfo, String> {
+    let registry = if use_mirror {
+        NPM_MIRROR_REGISTRY
+    } else {
+        NPM_OFFICIAL_REGISTRY
+    };
+    let pkg_name = package_name.trim();
+    if pkg_name.is_empty() {
+        return Err("包名不能为空".into());
+    }
+    // npm scoped 包名在 URL 中必须将斜杠编码为 %2F
+    let pkg_encoded = if pkg_name.starts_with('@') {
+        pkg_name.replacen('/', "%2F", 1)
+    } else {
+        pkg_name.to_string()
+    };
+    let url = format!("{registry}/{pkg_encoded}");
+    let payload = fetch_text(&url)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|e| format!("解析 npm 元数据失败：{e}"))?;
+
+    let mut dist_tags = std::collections::BTreeMap::new();
+    if let Some(tags) = value.get("dist-tags").and_then(|t| t.as_object()) {
+        for (k, v) in tags {
+            if let Some(tag_ver) = v.as_str() {
+                dist_tags.insert(k.clone(), tag_ver.to_string());
+            }
+        }
+    }
+    let latest = dist_tags.get("latest").cloned();
+
+    let mut versions = Vec::new();
+    let mut release_times = std::collections::HashMap::new();
+    if let Some(time) = value.get("time").and_then(|t| t.as_object()) {
+        let mut time_pairs: Vec<(&String, &serde_json::Value)> = time
+            .iter()
+            .filter(|(k, _)| *k != "created" && *k != "modified")
+            .collect();
+        time_pairs.sort_by(|a, b| {
+            let time_a = a.1.as_str().unwrap_or("");
+            let time_b = b.1.as_str().unwrap_or("");
+            time_b.cmp(time_a)
+        });
+        for (ver, val) in time_pairs {
+            versions.push(ver.clone());
+            if let Some(date_str) = val.as_str() {
+                let date_only = date_str.split('T').next().unwrap_or(date_str);
+                release_times.insert(ver.clone(), date_only.to_string());
+            }
+        }
+    }
+    if versions.is_empty() {
+        if let Some(vers) = value.get("versions").and_then(|v| v.as_object()) {
+            for k in vers.keys() {
+                versions.push(k.clone());
+            }
+            versions.sort_by(|a, b| {
+                match (semver::Version::parse(a), semver::Version::parse(b)) {
+                    (Ok(va), Ok(vb)) => vb.cmp(&va),
+                    _ => b.cmp(a),
+                }
+            });
+        }
+    }
+
+    Ok(PackageVersionInfo {
+        package_name: pkg_name.to_string(),
+        latest,
+        dist_tags,
+        versions,
+        release_times,
     })
 }
 

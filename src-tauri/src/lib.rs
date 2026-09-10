@@ -260,6 +260,58 @@ async fn run_profile_clean(app: AppHandle, profile: Option<String>) -> Result<()
     }
 }
 
+/// 在指定 Profile 中安装/更新插件（支持指定版本）：
+#[tauri::command]
+async fn install_profile_plugin(
+    app: AppHandle,
+    profile: Option<String>,
+    name: String,
+    version: Option<String>,
+) -> Result<(), String> {
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        service::install_profile_plugin(
+            &app,
+            profile.as_deref().unwrap_or("web"),
+            &name,
+            version.as_deref(),
+        )
+    })
+    .await;
+    match task {
+        Ok(result) => result,
+        Err(error) => Err(format!("安装插件任务异常结束：{error}")),
+    }
+}
+
+/// 在外部环境中直接执行 npm 全局安装/升级 DSH：
+#[tauri::command]
+async fn install_external_dsh(
+    app: AppHandle,
+    version: String,
+) -> Result<String, String> {
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        service::install_external_dsh(&app, &version)
+    })
+    .await;
+    match task {
+        Ok(result) => result,
+        Err(error) => Err(format!("安装 DSH 任务异常结束：{error}")),
+    }
+}
+
+/// 通用包版本查询接口（支持从 npm 动态拉取 tags 和 versions 列表）。
+#[tauri::command]
+async fn fetch_package_versions(
+    package_name: String,
+    use_mirror: Option<bool>,
+) -> Result<managed::PackageVersionInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        managed::fetch_package_versions(&package_name, use_mirror.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("获取版本列表失败：{error}"))?
+}
+
 /// 显式以内嵌视图打开/揭示 DSH。
 #[tauri::command]
 async fn open_embedded_view(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
@@ -338,10 +390,11 @@ async fn install_managed_runtime(
     app: AppHandle,
     root: String,
     use_mirror: bool,
+    version: Option<String>,
 ) -> Result<managed::ManagedStatus, String> {
     let log_app = app.clone();
     let task = tauri::async_runtime::spawn_blocking(move || {
-        managed::install_managed(app, PathBuf::from(root), use_mirror)
+        managed::install_managed(app, PathBuf::from(root), use_mirror, version)
     })
     .await;
     match task {
@@ -364,6 +417,7 @@ async fn upgrade_managed_dsh(
     app: AppHandle,
     state: State<'_, AppState>,
     root: String,
+    version: Option<String>,
 ) -> Result<managed::ManagedStatus, String> {
     if let Err(error) = managed::managed_status(PathBuf::from(&root).as_path()) {
         service::emit_log(&app, "installer", "error", &error);
@@ -391,7 +445,7 @@ async fn upgrade_managed_dsh(
     }
     let log_app = app.clone();
     let task = tauri::async_runtime::spawn_blocking(move || {
-        managed::upgrade_managed(app, PathBuf::from(root))
+        managed::upgrade_managed(app, PathBuf::from(root), version)
     })
     .await;
     state.maintenance.store(false, Ordering::Release);
@@ -533,6 +587,7 @@ pub fn run() {
             open_profile_dir,
             list_profile_plugins,
             uninstall_profile_plugin,
+            install_profile_plugin,
             run_profile_clean,
             check_launcher_update,
             open_release_page,
@@ -541,6 +596,8 @@ pub fn run() {
             managed_runtime_status,
             check_latest_dsh,
             check_dsh_version,
+            fetch_package_versions,
+            install_external_dsh,
             app_update::app_update_check,
             app_update::app_update_install,
             app_update::app_update_restart,

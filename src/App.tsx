@@ -106,6 +106,25 @@ interface ProfilePlugin {
   installedAt?: string | null;
 }
 
+interface PackageVersionInfo {
+  packageName: string;
+  latest?: string;
+  distTags: Record<string, string>;
+  versions: string[];
+  releaseTimes?: Record<string, string>;
+}
+
+function formatVersionOption(ver: string, tag?: string, releaseTimes?: Record<string, string>): string {
+  const date = releaseTimes?.[ver];
+  const parts: string[] = [];
+  if (tag) parts.push(tag);
+  if (date) parts.push(date);
+  if (parts.length > 0) {
+    return `v${ver} (${parts.join(" · ")})`;
+  }
+  return `v${ver}`;
+}
+
 function formatPluginDate(dateStr: string): string {
   try {
     const d = new Date(dateStr);
@@ -211,6 +230,7 @@ export default function App() {
   const [dshVersionChecking, setDshVersionChecking] = useState(false);
   const [dshVersionCheckError, setDshVersionCheckError] = useState<string | null>(null);
   const [externalDshCopyState, setExternalDshCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const [externalInstallBusy, setExternalInstallBusy] = useState(false);
   const [status, setStatus] = useState<ServiceStatus>(emptyStatus);
   const [embeddedWebviewOpen, setEmbeddedWebviewOpen] = useState(false);
   // 内容页是否完成加载：未就绪时保持内容隐藏，避免启动/切换时的白屏闪烁
@@ -250,6 +270,23 @@ export default function App() {
   const [pluginsSearch, setPluginsSearch] = useState("");
   const [uninstallingName, setUninstallingName] = useState<string | null>(null);
   const [cleanBusy, setCleanBusy] = useState(false);
+  // DSH 动态版本选择
+  const [dshPackageVersions, setDshPackageVersions] = useState<PackageVersionInfo | null>(null);
+  const [selectedDshVersion, setSelectedDshVersion] = useState<string>("");
+  // 插件安装与指定版本
+  const [newPluginName, setNewPluginName] = useState("");
+  const [newPluginVersion, setNewPluginVersion] = useState("");
+  const [newPluginVersions, setNewPluginVersions] = useState<PackageVersionInfo | null>(null);
+  const [newPluginLoading, setNewPluginLoading] = useState(false);
+  const [pluginInstalling, setPluginInstalling] = useState(false);
+  // 插件独立弹窗切换版本
+  const [switchVersionPlugin, setSwitchVersionPlugin] = useState<ProfilePlugin | null>(null);
+  const [switchTargetVersion, setSwitchTargetVersion] = useState<string>("");
+  const [switchPackageVersions, setSwitchPackageVersions] = useState<PackageVersionInfo | null>(null);
+  const [switchVersionsLoading, setSwitchVersionsLoading] = useState(false);
+  const [switchInstalling, setSwitchInstalling] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+  const switchDialogRef = useRef<HTMLElement>(null);
   const logEnd = useRef<HTMLDivElement>(null);
   const pageContentRef = useRef<HTMLDivElement>(null);
   const installDialogRef = useRef<HTMLElement>(null);
@@ -668,9 +705,23 @@ export default function App() {
     setDshVersionChecking(true);
     setDshVersionDialogOpen(true);
     const requestSeq = ++versionCheckSeq.current;
+    invoke<PackageVersionInfo>("fetch_package_versions", {
+      packageName: "@deepseek-ai/dsh",
+      useMirror,
+    })
+      .then((pkg) => {
+        if (versionCheckSeq.current === requestSeq) {
+          setDshPackageVersions(pkg);
+          setSelectedDshVersion((curr) => curr || pkg.distTags.next || pkg.latest || pkg.versions[0] || "");
+        }
+      })
+      .catch(() => {});
     try {
       const info = await invoke<DshVersionInfo>("check_dsh_version", { currentVersion: version });
-      if (versionCheckSeq.current === requestSeq) setDshVersionInfo(info);
+      if (versionCheckSeq.current === requestSeq) {
+        setDshVersionInfo(info);
+        setSelectedDshVersion((curr) => curr || info.latestVersion);
+      }
     } catch (reason) {
       if (versionCheckSeq.current === requestSeq) setDshVersionCheckError(errorMessage(reason));
     } finally {
@@ -757,7 +808,7 @@ export default function App() {
     }
   }
 
-  async function upgradeManagedDsh() {
+  async function upgradeManagedDsh(targetVersion?: string) {
     if (!managed) return;
     const confirmed = await confirmDialog(t.upgradeConfirmMessage, {
       title: t.upgradeConfirmTitle,
@@ -771,7 +822,10 @@ export default function App() {
     setManagedProgress({ phase: "upgrade", message: t.upgradingDsh, percent: 0 });
     setError(null);
     try {
-      const result = await invoke<ManagedStatus>("upgrade_managed_dsh", { root: managed.managedRoot });
+      const result = await invoke<ManagedStatus>("upgrade_managed_dsh", {
+        root: managed.managedRoot,
+        version: targetVersion || null,
+      });
       setManaged(result);
       setVersion(result.dshVersion);
       setLatestDsh(result.dshVersion);
@@ -943,9 +997,104 @@ export default function App() {
     }
   }
 
+  async function queryNewPluginVersions() {
+    const name = newPluginName.trim();
+    if (!name) return;
+    setNewPluginLoading(true);
+    setNewPluginVersions(null);
+    try {
+      const info = await invoke<PackageVersionInfo>("fetch_package_versions", {
+        packageName: name,
+        useMirror,
+      });
+      setNewPluginVersions(info);
+      setNewPluginVersion(info.latest || info.versions[0] || "");
+    } catch (reason) {
+      setPluginsError(errorMessage(reason));
+    } finally {
+      setNewPluginLoading(false);
+    }
+  }
+
+  async function installNewPlugin() {
+    const name = newPluginName.trim();
+    if (!name) return;
+    setPluginInstalling(true);
+    setPluginsError(null);
+    try {
+      await invoke("install_profile_plugin", {
+        profile: config?.profile || "web",
+        name,
+        version: newPluginVersion.trim() || null,
+      });
+      setNewPluginName("");
+      setNewPluginVersion("");
+      setNewPluginVersions(null);
+      await refreshPlugins();
+    } catch (reason) {
+      setPluginsError(errorMessage(reason));
+    } finally {
+      setPluginInstalling(false);
+    }
+  }
+
+  async function openSwitchVersionDialog(plugin: ProfilePlugin) {
+    setSwitchVersionPlugin(plugin);
+    setSwitchTargetVersion("");
+    setSwitchPackageVersions(null);
+    setSwitchError(null);
+    setSwitchVersionsLoading(true);
+    try {
+      const info = await invoke<PackageVersionInfo>("fetch_package_versions", {
+        packageName: plugin.name,
+        useMirror,
+      });
+      setSwitchPackageVersions(info);
+      setSwitchTargetVersion(info.latest || info.versions[0] || "");
+    } catch (reason) {
+      setSwitchError(errorMessage(reason));
+    } finally {
+      setSwitchVersionsLoading(false);
+    }
+  }
+
+  async function executeSwitchPluginVersion() {
+    if (!switchVersionPlugin || !switchTargetVersion) return;
+    setSwitchInstalling(true);
+    setSwitchError(null);
+    try {
+      await invoke("install_profile_plugin", {
+        profile: config?.profile || "web",
+        name: switchVersionPlugin.name,
+        version: switchTargetVersion,
+      });
+      setSwitchVersionPlugin(null);
+      await refreshPlugins();
+    } catch (reason) {
+      setSwitchError(errorMessage(reason));
+    } finally {
+      setSwitchInstalling(false);
+    }
+  }
+
+  async function runInstallExternalDsh(targetVer: string) {
+    if (!targetVer) return;
+    setExternalInstallBusy(true);
+    setSettingsOpen(true);
+    try {
+      await invoke("install_external_dsh", { version: targetVer });
+      await detectDsh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setExternalInstallBusy(false);
+    }
+  }
+
   async function copyExternalDshCommand() {
-    if (!dshVersionInfo?.updateAvailable) return;
-    const command = `npm install -g @deepseek-ai/dsh@${dshVersionInfo.latestVersion}`;
+    const targetVer = selectedDshVersion || dshVersionInfo?.latestVersion;
+    if (!targetVer) return;
+    const command = `npm install -g @deepseek-ai/dsh@${targetVer}`;
     try {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
       await navigator.clipboard.writeText(command);
@@ -1343,25 +1492,80 @@ export default function App() {
                 <>
                   <p className="dsh-version-line"><strong>{t.dshVersionCurrent}</strong> v{dshVersionInfo.currentVersion}</p>
                   <p className="dsh-version-line"><strong>{t.dshVersionLatest}</strong> v{dshVersionInfo.latestVersion}</p>
+
+                  {dshPackageVersions && (
+                    <div className="mini-field" style={{ marginBottom: 12 }}>
+                      <label htmlFor="dsh-version-select"><strong>{t.targetVersion}</strong></label>
+                      <select
+                        id="dsh-version-select"
+                        value={selectedDshVersion || dshVersionInfo.latestVersion}
+                        onChange={(event) => setSelectedDshVersion(event.target.value)}
+                        style={{ width: "100%", padding: "6px 8px", borderRadius: 4, background: "var(--bg-card)", color: "var(--fg-main)", border: "1px solid var(--border-color)" }}
+                      >
+                        {Object.entries(dshPackageVersions.distTags).map(([tag, ver]) => (
+                          <option key={`dsh-tag-${tag}`} value={ver}>
+                            {formatVersionOption(ver, tag, dshPackageVersions.releaseTimes)}
+                          </option>
+                        ))}
+                        {dshPackageVersions.versions.slice(0, 30).map((ver) => (
+                          <option key={`dsh-ver-${ver}`} value={ver}>
+                            {formatVersionOption(ver, undefined, dshPackageVersions.releaseTimes)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
                   <label>{t.dshCurrentNotesLabel}</label>
                   <div className="app-update-notes">{dshVersionInfo.currentNotes || t.dshUpdateNotesEmpty}</div>
-                  {dshVersionInfo.updateAvailable ? (
+                  {managed ? (
+                    <div style={{ marginTop: 12 }}>
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={managedBusy}
+                        onClick={() => void upgradeManagedDsh(selectedDshVersion || dshVersionInfo.latestVersion)}
+                        style={{ width: "100%", justifyContent: "center" }}
+                      >
+                        <Download size={13} />
+                        {t.upgradeToSelectedVersion} (v{selectedDshVersion || dshVersionInfo.latestVersion})
+                      </button>
+                    </div>
+                  ) : (
                     <>
-                      <label>{t.dshLatestNotesLabel}</label>
-                      <div className="app-update-notes">{dshVersionInfo.latestNotes || t.dshUpdateNotesEmpty}</div>
+                      {dshVersionInfo.updateAvailable && (
+                        <>
+                          <label>{t.dshLatestNotesLabel}</label>
+                          <div className="app-update-notes">{dshVersionInfo.latestNotes || t.dshUpdateNotesEmpty}</div>
+                        </>
+                      )}
                       <label htmlFor="dsh-update-command">{t.dshUpdateCommandLabel}</label>
                       <div className="command-input update-command-input">
-                        <input id="dsh-update-command" readOnly value={`npm install -g @deepseek-ai/dsh@${dshVersionInfo.latestVersion}`} />
+                        <input
+                          id="dsh-update-command"
+                          readOnly
+                          value={`npm install -g @deepseek-ai/dsh@${selectedDshVersion || dshVersionInfo.latestVersion}`}
+                        />
                         <button type="button" onClick={() => void copyExternalDshCommand()} title={t.dshUpdateCopyCommand} aria-label={t.dshUpdateCopyCommand}>
                           <Copy size={14} />
+                        </button>
+                      </div>
+                      <div style={{ marginTop: 10, marginBottom: 6 }}>
+                        <button
+                          type="button"
+                          className="primary"
+                          disabled={externalInstallBusy}
+                          onClick={() => void runInstallExternalDsh(selectedDshVersion || dshVersionInfo.latestVersion)}
+                          style={{ width: "100%", justifyContent: "center" }}
+                        >
+                          <Download size={13} />
+                          {externalInstallBusy ? t.executingInstall : `${t.executeInstallNow} (v${selectedDshVersion || dshVersionInfo.latestVersion})`}
                         </button>
                       </div>
                       <p className="dsh-update-warning" role="note">{t.dshUpdateWarning}</p>
                       {externalDshCopyState === "copied" && <p className="app-update-success" role="status">{t.dshUpdateCopied}</p>}
                       {externalDshCopyState === "failed" && <p className="install-dialog-error" role="alert">{t.dshUpdateCopyFailed}</p>}
                     </>
-                  ) : (
-                    <p className="app-update-success" role="status">{t.dshVersionUpToDate}</p>
                   )}
                 </>
               )}
@@ -1452,6 +1656,59 @@ export default function App() {
             <header><h2 id="plugins-dialog-title">{t.pluginsDialogTitle}</h2></header>
             <div className="install-dialog-body">
               <p className="plugins-hint">{t.pluginsDialogHint}</p>
+              <div className="plugin-install-bar" style={{ marginBottom: 10 }}>
+                <input
+                  type="text"
+                  className="plugin-install-input"
+                  placeholder={t.pluginNamePlaceholder}
+                  value={newPluginName}
+                  onChange={(event) => {
+                    setNewPluginName(event.target.value);
+                    setNewPluginVersions(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void queryNewPluginVersions();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="plugin-install-btn"
+                  disabled={!newPluginName.trim() || newPluginLoading}
+                  onClick={() => void queryNewPluginVersions()}
+                >
+                  <RefreshCw size={11} className={newPluginLoading ? "spin" : undefined} />
+                  {t.pluginQueryVersions}
+                </button>
+                {newPluginVersions && (
+                  <select
+                    className="plugin-version-select"
+                    value={newPluginVersion}
+                    onChange={(event) => setNewPluginVersion(event.target.value)}
+                  >
+                    <option value="">{t.selectVersionPlaceholder}</option>
+                    {Object.entries(newPluginVersions.distTags).map(([tag, ver]) => (
+                      <option key={`new-tag-${tag}`} value={ver}>
+                        {formatVersionOption(ver, tag, newPluginVersions.releaseTimes)}
+                      </option>
+                    ))}
+                    {newPluginVersions.versions.slice(0, 25).map((ver) => (
+                      <option key={`new-ver-${ver}`} value={ver}>
+                        {formatVersionOption(ver, undefined, newPluginVersions.releaseTimes)}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  className="primary plugin-install-btn"
+                  disabled={!newPluginName.trim() || pluginInstalling}
+                  onClick={() => void installNewPlugin()}
+                >
+                  <Download size={11} />
+                  {pluginInstalling ? t.pluginInstalling : t.pluginInstallAction}
+                </button>
+              </div>
+
               <div className="plugins-search-bar">
                 <Search size={13} className="plugins-search-icon" aria-hidden="true" />
                 <input
@@ -1488,7 +1745,7 @@ export default function App() {
                     <div className="plugin-meta">
                       <strong>{plugin.name}</strong>
                       <div className="plugin-details">
-                        <small className="plugin-version">{plugin.version}</small>
+                        <small className="plugin-version" title={plugin.version}>{plugin.version}</small>
                         {plugin.installedAt && (
                           <small className="plugin-installed-at" title={`${t.pluginInstalledAt}: ${formatPluginDate(plugin.installedAt)}`}>
                             {t.pluginInstalledAt} {formatPluginDate(plugin.installedAt)}
@@ -1496,14 +1753,25 @@ export default function App() {
                         )}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      className="plugin-uninstall"
-                      disabled={uninstallingName !== null}
-                      onClick={() => void uninstallPlugin(plugin.name)}
-                    >
-                      {uninstallingName === plugin.name ? t.uninstalling : t.uninstall}
-                    </button>
+                    <div className="plugin-actions">
+                      <button
+                        type="button"
+                        className="plugin-switch-btn"
+                        disabled={uninstallingName !== null || pluginInstalling}
+                        onClick={() => void openSwitchVersionDialog(plugin)}
+                        title={t.pluginUpdate}
+                      >
+                        {t.pluginUpdate}
+                      </button>
+                      <button
+                        type="button"
+                        className="plugin-uninstall"
+                        disabled={uninstallingName !== null || pluginInstalling}
+                        onClick={() => void uninstallPlugin(plugin.name)}
+                      >
+                        {uninstallingName === plugin.name ? t.uninstalling : t.uninstall}
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1513,6 +1781,87 @@ export default function App() {
                 <RefreshCw size={13} />{t.pluginsRefresh}
               </button>
               <button type="button" onClick={() => setPluginsDialogOpen(false)}>{t.cancel}</button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {switchVersionPlugin && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSwitchVersionPlugin(null)}>
+          <section
+            className="install-dialog"
+            style={{ width: "min(460px, 100%)" }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="switch-version-title"
+            tabIndex={-1}
+            ref={switchDialogRef}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <h2 id="switch-version-title">{t.switchPluginVersionTitle}</h2>
+            </header>
+            <div className="install-dialog-body">
+              <p className="dsh-version-line">
+                <strong>{switchVersionPlugin.name}</strong>
+              </p>
+              <p className="dsh-version-line">
+                <strong>{t.currentInstalledVersion}:</strong> {switchVersionPlugin.version}
+              </p>
+
+              {switchVersionsLoading && (
+                <p className="dsh-update-warning" role="status">
+                  <RefreshCw size={12} className="spin" /> {t.loadingVersions}
+                </p>
+              )}
+
+              {switchError && (
+                <p className="install-dialog-error" role="alert">
+                  {translateBackendMessage(switchError, lang)}
+                </p>
+              )}
+
+              {!switchVersionsLoading && switchPackageVersions && (
+                <div className="mini-field" style={{ marginTop: 8 }}>
+                  <label htmlFor="plugin-target-version"><strong>{t.targetVersion}</strong></label>
+                  <select
+                    id="plugin-target-version"
+                    value={switchTargetVersion}
+                    disabled={switchInstalling}
+                    onChange={(event) => setSwitchTargetVersion(event.target.value)}
+                    style={{ width: "100%", height: 34, padding: "0 10px", borderRadius: 6, background: "var(--bg-card)", color: "var(--fg-main)", border: "1px solid var(--border-color)" }}
+                  >
+                    <option value="">{t.selectVersionPlaceholder}</option>
+                    {Object.entries(switchPackageVersions.distTags).map(([tag, ver]) => (
+                      <option key={`sw-tag-${tag}`} value={ver}>
+                        {formatVersionOption(ver, tag, switchPackageVersions.releaseTimes)}
+                      </option>
+                    ))}
+                    {switchPackageVersions.versions.slice(0, 30).map((ver) => (
+                      <option key={`sw-ver-${ver}`} value={ver}>
+                        {formatVersionOption(ver, undefined, switchPackageVersions.releaseTimes)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+            <footer>
+              <button
+                type="button"
+                className="primary"
+                disabled={!switchTargetVersion.trim() || switchInstalling || switchVersionsLoading}
+                onClick={() => void executeSwitchPluginVersion()}
+              >
+                <Download size={13} />
+                {switchInstalling ? t.switchingAction : t.switchActionConfirm}
+              </button>
+              <button
+                type="button"
+                disabled={switchInstalling}
+                onClick={() => setSwitchVersionPlugin(null)}
+              >
+                {t.cancel}
+              </button>
             </footer>
           </section>
         </div>

@@ -199,8 +199,11 @@ h1, h2, p { margin: 0; }
 .settings-tools-row button:hover:not(:disabled) { background: #f1f1f3; color: #33353a; }
 
 /* 插件管理弹窗 */
-.plugins-dialog { width: min(520px, 100%); }
+.plugins-dialog { width: min(580px, 100%); }
 .plugins-hint { margin: 0; padding: 7px 9px; border: 1px solid #e2e0ef; border-radius: 5px; background: #f6f5fb; color: #5e55b3; font-size: 9px; line-height: 1.5; }
+.plugin-install-bar { display: flex; align-items: center; gap: 6px; }
+.plugin-install-input { flex: 1 1 auto; height: 28px; padding: 0 8px; font-size: 11px; }
+.plugin-install-btn { display: inline-flex; height: 28px; flex: 0 0 auto; align-items: center; gap: 4px; padding: 0 10px; font-size: 10px; white-space: nowrap; }
 .plugins-search-bar { display: flex; align-items: center; position: relative; height: 30px; border: 1px solid #dadadd; border-radius: 5px; background: #fff; padding: 0 8px; gap: 6px; }
 .plugins-search-bar:focus-within { border-color: #8178c7; box-shadow: 0 0 0 2px rgb(94 85 179 / 11%); }
 .plugins-search-icon { flex: 0 0 auto; color: #999ba1; }
@@ -214,13 +217,18 @@ h1, h2, p { margin: 0; }
 .plugins-list .dsh-update-warning,
 .plugins-list .install-dialog-error,
 .plugins-list .app-update-success { margin: auto 0; text-align: center; }
-.plugin-row { display: flex; min-height: 40px; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 10px; border: 1px solid #e7e7ea; border-radius: 5px; background: #fcfcfd; }
-.plugin-meta { display: grid; min-width: 0; gap: 2px; }
-.plugin-meta strong { overflow: hidden; color: #33353a; font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.plugin-details { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.plugin-row { display: flex; min-height: 42px; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 12px; border: 1px solid #e7e7ea; border-radius: 6px; background: #fcfcfd; }
+.plugin-meta { display: grid; min-width: 0; flex: 1 1 auto; gap: 3px; }
+.plugin-meta strong { overflow: hidden; color: #33353a; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-details { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
 .plugin-details small { color: #999ba1; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.plugin-installed-at { color: #85878d !important; }
-.plugin-uninstall { display: inline-flex; height: 26px; flex: 0 0 auto; align-items: center; gap: 4px; padding: 0 9px; border: 1px solid #dfc4c4; border-radius: 4px; background: #fff; color: #a94444; font-size: 9px; }
+.plugin-version { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 1; }
+.plugin-installed-at { color: #85878d !important; flex-shrink: 0; }
+.plugin-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.plugin-switch-btn { display: inline-flex; height: 26px; flex: 0 0 auto; align-items: center; gap: 4px; padding: 0 10px; border: 1px solid #c7c5dd; border-radius: 4px; background: #fff; color: #5e55b3; font-size: 10px; white-space: nowrap; cursor: pointer; }
+.plugin-switch-btn:hover:not(:disabled) { border-color: #8178c7; background: #f6f5fb; color: #4b429f; }
+.plugin-version-select { height: 28px; padding: 0 8px; border: 1px solid #dadadd; border-radius: 4px; background: #fff; color: #33353a; font-size: 11px; flex: 0 0 auto; max-width: 150px; }
+.plugin-uninstall { display: inline-flex; height: 26px; flex: 0 0 auto; align-items: center; gap: 4px; padding: 0 10px; border: 1px solid #dfc4c4; border-radius: 4px; background: #fff; color: #a94444; font-size: 10px; white-space: nowrap; cursor: pointer; }
 .plugin-uninstall:hover:not(:disabled) { border-color: #c96868; background: #fff5f5; color: #a93434; }
 
 /* ---------- 表单控件 ---------- */
@@ -404,6 +412,9 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 [data-theme="dark"] .plugin-meta strong { color: #e4e5e8; }
 [data-theme="dark"] .plugin-details small { color: #767881; }
 [data-theme="dark"] .plugin-installed-at { color: #8a8c95 !important; }
+[data-theme="dark"] .plugin-switch-btn { border-color: #4b466d; background: #232230; color: #a49de0; }
+[data-theme="dark"] .plugin-switch-btn:hover:not(:disabled) { border-color: #6c64a8; background: #2c2b3d; color: #c2bcf5; }
+[data-theme="dark"] .plugin-version-select { border-color: #3a3c42; background: #1e1f23; color: #e5e5ea; }
 [data-theme="dark"] .plugin-uninstall { border-color: #683c3c; background: #2b2325; color: #e49a9a; }
 [data-theme="dark"] .plugin-uninstall:hover:not(:disabled) { border-color: #824b50; background: #3b2529; color: #e1848b; }
 [data-theme="dark"] .quick-actions button:hover:not(:disabled),

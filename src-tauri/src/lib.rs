@@ -101,16 +101,27 @@ fn save_config(app: AppHandle, config: LauncherConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn detect_dsh() -> Result<(String, String), String> {
+fn detect_dsh(app: AppHandle) -> Result<(String, String), String> {
     let path =
         service::resolve_dsh("").ok_or_else(|| "未找到 dsh，请手动指定可执行文件".to_string())?;
     let version = service::dsh_version(&path)?;
+    let (envs, _) = service::launcher_environment();
+    let node_info = service::format_tool_info("node", &envs);
+    service::emit_log(&app, "launcher", "info", &format!("Node: {node_info}"));
+    let pnpm_info = service::format_tool_info("pnpm", &envs);
+    service::emit_log(&app, "launcher", "info", &format!("pnpm: {pnpm_info}"));
     Ok((path.to_string_lossy().into_owned(), version))
 }
 
 #[tauri::command]
-fn validate_dsh(path: String) -> Result<String, String> {
-    service::dsh_version(&PathBuf::from(path))
+fn validate_dsh(app: AppHandle, path: String) -> Result<String, String> {
+    let version = service::dsh_version(&PathBuf::from(&path))?;
+    let (envs, _) = service::launcher_environment();
+    let node_info = service::format_tool_info("node", &envs);
+    service::emit_log(&app, "launcher", "info", &format!("Node: {node_info}"));
+    let pnpm_info = service::format_tool_info("pnpm", &envs);
+    service::emit_log(&app, "launcher", "info", &format!("pnpm: {pnpm_info}"));
+    Ok(version)
 }
 
 #[tauri::command]

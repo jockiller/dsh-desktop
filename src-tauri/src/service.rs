@@ -572,6 +572,12 @@ impl ServiceManager {
             append_service_path(&mut envs, &path_entries);
         }
 
+        let node_info = format_tool_info("node", &envs);
+        emit_log(&app, "launcher", "info", &format!("Node: {node_info}"));
+
+        let pnpm_info = format_tool_info("pnpm", &envs);
+        emit_log(&app, "launcher", "info", &format!("pnpm: {pnpm_info}"));
+
         let mut command = Command::new(&dsh);
         // Windows GUI 宿主下启动控制台程序（node/dsh.cmd→cmd.exe）会闪现控制台窗口。
         // .cmd/.bat 由 std 自动经 cmd.exe 调用并转义各参数（见 dsh_version 注释）；
@@ -1970,7 +1976,7 @@ fn nvm_windows_version_dirs(nvm_root: &Path) -> Vec<PathBuf> {
 /// 组装启动 DSH 子进程的环境：先继承 Launcher 环境，再用默认登录 Shell 中的工具链
 /// 变量覆盖 PATH、PNPM_HOME、nvm/volta 等。GUI 启动时通常没有读取用户 shell rc
 /// 文件；采集失败时仍保留当前环境，避免丢失 DSH_HOME、凭据等运行时变量。
-fn launcher_environment() -> (Vec<(OsString, OsString)>, bool) {
+pub(crate) fn launcher_environment() -> (Vec<(OsString, OsString)>, bool) {
     let base = std::env::vars_os().collect::<Vec<_>>();
 
     #[cfg(unix)]
@@ -2010,9 +2016,12 @@ fn should_overlay_shell_environment_key(key: &OsStr) -> bool {
         "PATH"
             | "MANPATH"
             | "PNPM_HOME"
+            | "NODE_PATH"
             | "NVM_DIR"
             | "NVM_BIN"
             | "NVM_PATH"
+            | "NVM_INC"
+            | "NVM_CD_FLAGS"
             | "VOLTA_HOME"
             | "VOLTA_BIN"
             | "ASDF_DIR"
@@ -2135,10 +2144,12 @@ const LOGIN_SHELL_MARKER: &str = "__DSH_LAUNCHER_ENV__";
 /// 误传给另一种 Shell。
 #[cfg(unix)]
 const LOGIN_SHELL_ENV_SCRIPT: &str = concat!(
+    "set +C 2>/dev/null || true; ",
+    "set +o noclobber 2>/dev/null || true; ",
     "umask 077; ",
     "echo ",
     "__DSH_LAUNCHER_ENV__",
-    r#" > "$DSH_LAUNCHER_ENV_FILE"; "#,
+    r#" >| "$DSH_LAUNCHER_ENV_FILE"; "#,
     r#"env -0 >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null || env >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null"#
 );
 
@@ -2154,15 +2165,23 @@ const LOGIN_SHELL_FISH_ENV_SCRIPT: &str = concat!(
 /// 通过登录 Shell 定位 dsh：`command -v` 是内建命令，POSIX Shell 与 fish 均支持。
 #[cfg(unix)]
 const LOGIN_SHELL_DSH_SCRIPT: &str = concat!(
+    "set +C 2>/dev/null || true; ",
+    "set +o noclobber 2>/dev/null || true; ",
     "umask 077; ",
-    r#"echo "__DSH_LAUNCHER_ENV__" > "$DSH_LAUNCHER_ENV_FILE"; "#,
+    r#"echo "__DSH_LAUNCHER_ENV__" >| "$DSH_LAUNCHER_ENV_FILE"; "#,
     r#"command -v dsh >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null"#
 );
 
-/// 登录 Shell 启动参数：优先 `-li -c`（与原实现一致的登录+交互环境，zsh 需 -i 才能读到 .zshrc 中的 PATH 设置）；
-/// 再回退裸 `-c`，覆盖不支持 `-li` 的 Shell。每组的最后一项必须是 `-c`，保证脚本被执行。
+/// 登录 Shell 启动参数：覆盖单独传参与组合传参，
+/// 优先 `["-l", "-i", "-c"]`（标准 POSIX 参数分解），其次 `["-li", "-c"]`，
+/// 再回退到非交互式登录 `["-l", "-c"]` 与纯脚本执行 `["-c"]`。
 #[cfg(unix)]
-const LOGIN_SHELL_ARGSETS: &[&[&str]] = &[&["-li", "-c"], &["-c"]];
+const LOGIN_SHELL_ARGSETS: &[&[&str]] = &[
+    &["-l", "-i", "-c"],
+    &["-li", "-c"],
+    &["-l", "-c"],
+    &["-c"],
+];
 
 /// SHELL 缺失或不可用时依次尝试的登录 Shell 路径，全部覆盖常见发行版：bash（多数 Linux 默认）、zsh（macOS 默认）、sh（POSIX 兜底）。
 #[cfg(unix)]
@@ -2205,15 +2224,32 @@ fn login_shell_candidates(env_shell: Option<&str>, exists: &dyn Fn(&Path) -> boo
 
 #[cfg(unix)]
 fn available_login_shells() -> Vec<PathBuf> {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(default_login_shell);
+    let shell = default_login_shell()
+        .or_else(|| std::env::var("SHELL").ok().filter(|value| !value.trim().is_empty()));
     login_shell_candidates(shell.as_deref(), &|path| path.is_file())
 }
 
 #[cfg(unix)]
 fn default_login_shell() -> Option<String> {
+    // 优先通过标准 libc getpwuid 读取系统用户数据库中的默认登录 Shell，避免进程拉起开销且不依赖外部命令
+    #[allow(unused_unsafe)]
+    let passwd_shell = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if !pw.is_null() && !(*pw).pw_shell.is_null() {
+            std::ffi::CStr::from_ptr((*pw).pw_shell)
+                .to_str()
+                .ok()
+                .map(str::trim)
+                .filter(|shell| !shell.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        }
+    };
+    if let Some(shell) = passwd_shell {
+        return Some(shell);
+    }
+
     #[cfg(target_os = "macos")]
     {
         let user = std::env::var("USER")
@@ -2348,6 +2384,14 @@ fn spawn_with_timeout(
     if let Some(environment) = environment {
         command.env_clear().envs(environment.iter().cloned());
     }
+    // 在子进程启动前开启全新会话（setsid），防止交互式 Shell 抢占终端控制权并在无真实 TTY 时因 ioctl 报错失败
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let Ok(mut child) = command.spawn() else {
         return SpawnOutcome::NotRunnable;
     };
@@ -2390,6 +2434,27 @@ fn login_shell_base_environment(shell: &Path, output_file: &Path) -> Vec<(OsStri
         &mut environment,
         OsStr::new("PATH"),
         default_login_shell_path().as_os_str(),
+    );
+    // 屏蔽 Oh-My-Zsh / Oh-My-Bash / brew 等在探针启动时的自动更新与终端警告，防止阻塞探针
+    set_environment_value(
+        &mut environment,
+        OsStr::new("DISABLE_AUTO_UPDATE"),
+        OsStr::new("true"),
+    );
+    set_environment_value(
+        &mut environment,
+        OsStr::new("ZSH_TMUX_AUTOSTARTED"),
+        OsStr::new("true"),
+    );
+    set_environment_value(
+        &mut environment,
+        OsStr::new("ZSH_TMUX_AUTOSTART"),
+        OsStr::new("false"),
+    );
+    set_environment_value(
+        &mut environment,
+        OsStr::new("BASH_SILENCE_DEPRECATION_WARNING"),
+        OsStr::new("1"),
     );
     environment
 }
@@ -2488,12 +2553,14 @@ fn run_login_shell_capture(
         let mut argv: Vec<&OsStr> = argset.iter().map(OsStr::new).collect();
         argv.push(OsStr::new(script));
         argv.push(OsStr::new("dsh-desktop"));
-        if let SpawnOutcome::Completed { success: true } =
-            spawn_with_timeout(&shell, &argv, remaining, Some(&shell_environment))
+        let _ = fs::write(&temp_file, b"");
+        let outcome = spawn_with_timeout(&shell, &argv, remaining, Some(&shell_environment));
+        if let SpawnOutcome::Completed { .. } = outcome
             && let Ok(content) = fs::read(&temp_file)
             && let Some(after_marker) = extract_after_marker(&content, LOGIN_SHELL_MARKER)
         {
-            // 标记存在才说明脚本真正执行成功；否则（只有 Shell 自身输出）继续尝试下一组合。
+            // 只要标记后的环境变量内容已成功输出并提取，
+            // 即使用户终端脚本内某个第三方非关键命令退出了非 0 状态码，也安全接受并使用该环境变量
             payload = Some(after_marker.to_vec());
             break;
         }
@@ -2572,6 +2639,96 @@ fn find_common_install() -> Option<PathBuf> {
 
 fn is_executable_dsh(path: &Path) -> bool {
     path.is_file()
+}
+
+/// 在指定环境变量集（包含登录 Shell 合并后的 PATH）中寻找可执行文件（如 node, pnpm）
+pub(crate) fn resolve_executable_in_envs(
+    name: &str,
+    envs: &[(OsString, OsString)],
+) -> Option<PathBuf> {
+    let paths = envs
+        .iter()
+        .find(|(k, _)| environment_key_eq(k, OsStr::new("PATH")))?
+        .1
+        .clone();
+    let pathext = envs
+        .iter()
+        .find(|(k, _)| environment_key_eq(k, OsStr::new("PATHEXT")))
+        .and_then(|(_, v)| v.to_str().map(str::to_string))
+        .or_else(|| std::env::var("PATHEXT").ok());
+
+    let is_windows = cfg!(windows);
+    std::env::split_paths(&paths)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            if is_windows {
+                for ext in windows_extensions(pathext.as_deref()) {
+                    let candidate = dir.join(format!("{name}{ext}"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+                None
+            } else {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            }
+        })
+}
+
+/// 执行指定工具的 `--version` 探测版本（限时 1.5 秒），提取有效版本号单行
+pub(crate) fn probe_tool_version(
+    program: &Path,
+    envs: &[(OsString, OsString)],
+    timeout: Duration,
+) -> Option<String> {
+    let mut command = Command::new(program);
+    suppress_console_window(&mut command);
+    command
+        .envs(envs.iter().cloned())
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut stdout = child.stdout.take()?;
+                let mut buf = String::new();
+                stdout.read_to_string(&mut buf).ok()?;
+                let ver = buf.lines().map(str::trim).find(|l| !l.is_empty())?;
+                return Some(ver.to_string());
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 格式化工具信息用于控制台日志展示，例如 `/path/to/node (v24.20.0)` 或 `未检测到`
+pub(crate) fn format_tool_info(name: &str, envs: &[(OsString, OsString)]) -> String {
+    match resolve_executable_in_envs(name, envs) {
+        Some(path) => {
+            let version = probe_tool_version(&path, envs, Duration::from_millis(1500));
+            match version {
+                Some(ver) => format!("{} ({ver})", path.display()),
+                None => path.display().to_string(),
+            }
+        }
+        None => "未检测到 (not found)".to_string(),
+    }
 }
 
 /// 读取 dsh 版本。Windows 的 .cmd/.bat 批处理由标准库自动经由 cmd.exe 调用：程序路径与
@@ -3991,11 +4148,13 @@ mod tests {
         let plan = login_shell_attempt_plan(&shells);
         assert_eq!(plan.len(), shells.len() * LOGIN_SHELL_ARGSETS.len());
         assert_eq!(plan[0].0, PathBuf::from("/bin/zsh"));
-        assert_eq!(plan[0].1, &["-li", "-c"]);
+        assert_eq!(plan[0].1, &["-l", "-i", "-c"]);
         assert_eq!(plan[1].0, PathBuf::from("/bin/zsh"));
-        assert_eq!(plan[1].1, &["-c"], "同一 Shell 的第二参数组为裸 -c 兜底");
-        assert_eq!(plan[2].0, PathBuf::from("/bin/bash"));
-        assert_eq!(plan[3].0, PathBuf::from("/bin/bash"));
+        assert_eq!(plan[1].1, &["-li", "-c"]);
+        assert_eq!(plan[2].0, PathBuf::from("/bin/zsh"));
+        assert_eq!(plan[2].1, &["-l", "-c"]);
+        assert_eq!(plan[3].0, PathBuf::from("/bin/zsh"));
+        assert_eq!(plan[3].1, &["-c"]);
         assert!(
             LOGIN_SHELL_ARGSETS
                 .iter()
@@ -4062,6 +4221,10 @@ mod tests {
             if !environment_key_eq(&key, OsStr::new("PATH"))
                 && !environment_key_eq(&key, OsStr::new("SHELL"))
                 && !environment_key_eq(&key, OsStr::new("DSH_LAUNCHER_ENV_FILE"))
+                && !environment_key_eq(&key, OsStr::new("DISABLE_AUTO_UPDATE"))
+                && !environment_key_eq(&key, OsStr::new("ZSH_TMUX_AUTOSTARTED"))
+                && !environment_key_eq(&key, OsStr::new("ZSH_TMUX_AUTOSTART"))
+                && !environment_key_eq(&key, OsStr::new("BASH_SILENCE_DEPRECATION_WARNING"))
             {
                 assert_eq!(
                     environment_value(&environment, &key.to_string_lossy()),
@@ -4081,6 +4244,10 @@ mod tests {
             environment_value(&environment, "PATH"),
             Some(&default_login_shell_path())
         );
+        assert_eq!(
+            environment_value(&environment, "DISABLE_AUTO_UPDATE"),
+            Some(&OsString::from("true"))
+        );
     }
 
     #[cfg(unix)]
@@ -4090,7 +4257,10 @@ mod tests {
         assert!(should_overlay_shell_environment_key(OsStr::new(
             "PNPM_HOME"
         )));
+        assert!(should_overlay_shell_environment_key(OsStr::new("NODE_PATH")));
         assert!(should_overlay_shell_environment_key(OsStr::new("NVM_DIR")));
+        assert!(should_overlay_shell_environment_key(OsStr::new("NVM_BIN")));
+        assert!(should_overlay_shell_environment_key(OsStr::new("NVM_INC")));
         assert!(!should_overlay_shell_environment_key(OsStr::new("HOME")));
         assert!(!should_overlay_shell_environment_key(OsStr::new(
             "DSH_HOME"
@@ -4133,6 +4303,32 @@ mod tests {
         assert!(environment_key_eq(OsStr::new("Path"), OsStr::new("PATH")));
         #[cfg(not(windows))]
         assert!(!environment_key_eq(OsStr::new("Path"), OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn resolve_executable_in_envs_finds_file_and_handles_missing() {
+        let temp_dir = std::env::temp_dir().join(format!("test-tool-resolve-{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let fake_bin = temp_dir.join(if cfg!(windows) { "my-tool.cmd" } else { "my-tool" });
+        let _ = fs::write(&fake_bin, b"dummy");
+
+        let envs = vec![
+            (OsString::from("PATH"), temp_dir.as_os_str().to_os_string()),
+            (OsString::from("PATHEXT"), OsString::from(".CMD;.BAT;.EXE")),
+        ];
+
+        let found = resolve_executable_in_envs("my-tool", &envs);
+        assert_eq!(found, Some(fake_bin));
+
+        let not_found = resolve_executable_in_envs("nonexistent-tool-xyz", &envs);
+        assert_eq!(not_found, None);
+
+        assert_eq!(
+            format_tool_info("nonexistent-tool-xyz", &envs),
+            "未检测到 (not found)"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     // ---------- 标记与输出提取 ----------

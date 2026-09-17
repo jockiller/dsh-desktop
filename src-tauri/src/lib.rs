@@ -298,12 +298,46 @@ async fn install_profile_plugin(
 #[tauri::command]
 async fn install_external_dsh(
     app: AppHandle,
+    state: State<'_, AppState>,
     version: String,
 ) -> Result<String, String> {
+    state
+        .maintenance
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "已有维护升级任务正在进行".to_string())?;
+
+    let should_stop = state
+        .service
+        .lock()
+        .map_err(|e| e.to_string())?
+        .status()
+        .phase != "stopped";
+
+    if should_stop {
+        service::emit_log(&app, "installer", "info", "安装新版本前正在停止当前运行的 DSH 服务...");
+        let stop_result = state
+            .service
+            .lock()
+            .map_err(|error| error.to_string())
+            .and_then(|mut service| {
+                if service.status().phase == "external" {
+                    return Err("检测到 Launcher 无法停止的外部 DSH 服务，请先手动停止后再升级".into());
+                }
+                service.stop(Some(&app))
+            });
+        if let Err(error) = stop_result {
+            service::emit_log(&app, "installer", "error", &error);
+            state.maintenance.store(false, Ordering::Release);
+            return Err(error);
+        }
+    }
+
+    let log_app = app.clone();
     let task = tauri::async_runtime::spawn_blocking(move || {
-        service::install_external_dsh(&app, &version)
+        service::install_external_dsh(&log_app, &version)
     })
     .await;
+    state.maintenance.store(false, Ordering::Release);
     match task {
         Ok(result) => result,
         Err(error) => Err(format!("安装 DSH 任务异常结束：{error}")),

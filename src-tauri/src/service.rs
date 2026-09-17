@@ -3161,46 +3161,95 @@ fn kill_child_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// 等待子进程退出（带超时），返回合并后的输出；非零退出视为失败。
-fn wait_for_output(mut child: Child, display: String, timeout: Duration) -> Result<String, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .ok()
-                    .map(|out| {
-                        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        if !stderr.trim().is_empty() {
-                            if !text.trim().is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(&stderr);
-                        }
-                        text
-                    })
-                    .unwrap_or_default();
-                return if status.success() {
-                    Ok(output)
-                } else {
-                    Err(format!("{display} 失败：{output}"))
-                };
+/// 等待子进程退出（带超时），并在后台异步流式清空 stdout/stderr 管道避免缓冲区写满死锁。
+/// 若提供了 logger 上下文，实时将每行输出通过 emit_log 发送给前端。
+fn wait_for_output_with_logger(
+    mut child: Child,
+    display: String,
+    timeout: Duration,
+    log_target: Option<(&AppHandle, &'static str)>,
+) -> Result<String, String> {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_logger = log_target.map(|(app, target)| (app.clone(), target));
+    let stdout_thread = thread::spawn(move || {
+        let mut lines = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if let Some((ref app, target)) = stdout_logger {
+                    if !line.trim().is_empty() {
+                        emit_log(app, target, "info", &line);
+                    }
+                }
+                lines.push(line);
             }
+        }
+        lines.join("\n")
+    });
+
+    let stderr_logger = log_target.map(|(app, target)| (app.clone(), target));
+    let stderr_thread = thread::spawn(move || {
+        let mut lines = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if let Some((ref app, target)) = stderr_logger {
+                    if !line.trim().is_empty() {
+                        emit_log(app, target, "error", &line);
+                    }
+                }
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_child_tree(&mut child);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
                     return Err(format!(
                         "{display} 执行超时（{} 秒），子进程已被终止",
                         timeout.as_secs()
                     ));
                 }
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(100));
             }
-            Err(error) => return Err(format!("等待 {display} 退出失败：{error}")),
+            Err(error) => {
+                kill_child_tree(&mut child);
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!("等待 {display} 退出失败：{error}"));
+            }
         }
+    };
+
+    let stdout_out = stdout_thread.join().unwrap_or_default();
+    let stderr_out = stderr_thread.join().unwrap_or_default();
+
+    let mut output = stdout_out;
+    if !stderr_out.trim().is_empty() {
+        if !output.trim().is_empty() {
+            output.push('\n');
+        }
+        output.push_str(stderr_out.trim());
     }
+
+    match status_result {
+        Ok(status) if status.success() => Ok(output),
+        Ok(_) => Err(format!("{display} 失败：{output}")),
+        Err(err) => Err(err),
+    }
+}
+
+/// 等待子进程退出（带超时），返回合并后的输出；非零退出视为失败。
+fn wait_for_output(child: Child, display: String, timeout: Duration) -> Result<String, String> {
+    wait_for_output_with_logger(child, display, timeout, None)
 }
 
 /// 在指定目录执行 pnpm 命令（带超时），返回合并后的输出。
@@ -3208,7 +3257,11 @@ fn run_pnpm(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, Stri
     let mut command = pnpm_command(args);
     let (envs, _) = launcher_environment();
     command.envs(envs);
-    command.current_dir(dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_command_process_group(&mut command);
     let child = command
         .spawn()
@@ -3217,17 +3270,26 @@ fn run_pnpm(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, Stri
 }
 
 /// 执行 dsh 命令行（带超时），返回合并后的输出。
-fn run_dsh_cli(dsh_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+fn run_dsh_cli(
+    dsh_path: &Path,
+    args: &[&str],
+    timeout: Duration,
+    logger: Option<(&AppHandle, &'static str)>,
+) -> Result<String, String> {
     let mut command = Command::new(dsh_path);
     let (envs, _) = launcher_environment();
     command.envs(envs);
     suppress_console_window(&mut command);
-    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_command_process_group(&mut command);
     let child = command
         .spawn()
         .map_err(|error| format!("启动 dsh 失败：{error}"))?;
-    wait_for_output(child, format!("dsh {}", args.join(" ")), timeout)
+    wait_for_output_with_logger(child, format!("dsh {}", args.join(" ")), timeout, logger)
 }
 
 /// 通过 DSH 官方命令卸载插件：`dsh plugin --profile <p> uninstall <name>`。
@@ -3240,11 +3302,8 @@ pub fn uninstall_profile_plugin(app: &AppHandle, profile: &str, name: &str) -> R
         .ok_or_else(|| "未找到可执行的 dsh，请先在设置中指定 DSH 命令".to_string())?;
     emit_log(app, "plugins", "info", &format!("正在通过 dsh 卸载插件 {name}..."));
     let args = ["plugin", "--profile", profile, "uninstall", name];
-    match run_dsh_cli(&dsh_path, &args, PNPM_INSTALL_TIMEOUT) {
-        Ok(output) => {
-            if !output.trim().is_empty() {
-                emit_log(app, "plugins", "info", output.trim());
-            }
+    match run_dsh_cli(&dsh_path, &args, PNPM_INSTALL_TIMEOUT, Some((app, "plugins"))) {
+        Ok(_) => {
             emit_log(app, "plugins", "info", &format!("插件 {name} 已卸载"));
             Ok(())
         }
@@ -3299,6 +3358,8 @@ pub fn install_external_dsh(
     }
     emit_log(app, "installer", "info", &format!("正在通过 npm 全局安装 @deepseek-ai/dsh@{target_ver}..."));
 
+    let (envs, _) = launcher_environment();
+
     #[cfg(windows)]
     let mut command = {
         let mut cmd = Command::new("cmd");
@@ -3309,24 +3370,38 @@ pub fn install_external_dsh(
 
     #[cfg(not(windows))]
     let mut command = {
-        let mut cmd = Command::new("npm");
+        let npm_bin = resolve_executable_in_envs("npm", &envs);
+        let program = match npm_bin {
+            Some(path) => {
+                emit_log(app, "installer", "info", &format!("定位到 npm 程序：{}", path.display()));
+                path.into_os_string()
+            }
+            None => {
+                emit_log(app, "installer", "warn", "未在环境中解析到 npm 绝对路径，尝试系统默认 npm 命令");
+                OsString::from("npm")
+            }
+        };
+        let mut cmd = Command::new(program);
         cmd.args(["install", "-g", &format!("@deepseek-ai/dsh@{target_ver}")]);
         cmd
     };
 
-    let (envs, _) = launcher_environment();
     command.envs(envs);
+    command.stdin(Stdio::null());
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_command_process_group(&mut command);
 
     let child = command
         .spawn()
-        .map_err(|error| format!("启动 npm 失败，请检查 PATH 中是否包含 npm：{error}"))?;
+        .map_err(|error| format!("启动 npm 失败，请检查环境中是否包含 npm：{error}"))?;
 
-    let output = wait_for_output(child, format!("npm install -g @deepseek-ai/dsh@{target_ver}"), Duration::from_secs(600))?;
-    if !output.trim().is_empty() {
-        emit_log(app, "installer", "info", output.trim());
-    }
+    let _output = wait_for_output_with_logger(
+        child,
+        format!("npm install -g @deepseek-ai/dsh@{target_ver}"),
+        Duration::from_secs(600),
+        Some((app, "installer")),
+    )?;
+
     emit_log(app, "installer", "info", &format!("@deepseek-ai/dsh@{target_ver} 全局安装完成"));
     Ok(target_ver.to_string())
 }
@@ -3351,11 +3426,8 @@ pub fn install_profile_plugin(
 
     emit_log(app, "plugins", "info", &format!("正在通过 dsh 安装插件 {spec}..."));
     let args = ["plugin", "--profile", profile, "add", &spec];
-    match run_dsh_cli(&dsh_path, &args, PNPM_INSTALL_TIMEOUT) {
-        Ok(output) => {
-            if !output.trim().is_empty() {
-                emit_log(app, "plugins", "info", output.trim());
-            }
+    match run_dsh_cli(&dsh_path, &args, PNPM_INSTALL_TIMEOUT, Some((app, "plugins"))) {
+        Ok(_) => {
             emit_log(app, "plugins", "info", &format!("插件 {spec} 安装完成"));
             Ok(())
         }
@@ -4608,5 +4680,32 @@ mod tests {
         assert!(manager.session_cancel.lock().unwrap().is_none());
         assert!(manager.session_credentials.lock().unwrap().is_none());
         assert!(manager.authenticated_url.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_output_handles_large_output_without_deadlock() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "for i in $(seq 1 5000); do echo \"test-output-line-$i\"; done"]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn sh");
+        let result = wait_for_output(child, "test large output".into(), Duration::from_secs(10));
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains("test-output-line-1"));
+        assert!(output.contains("test-output-line-5000"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_output_captures_failure_and_stderr() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo 'something went wrong' >&2; exit 1"]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn sh");
+        let result = wait_for_output(child, "test fail".into(), Duration::from_secs(5));
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("something went wrong"));
     }
 }

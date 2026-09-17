@@ -1079,6 +1079,15 @@ export default function App() {
 
   async function runInstallExternalDsh(targetVer: string) {
     if (!targetVer) return;
+    if (status.phase === "running" || status.phase === "starting") {
+      const confirmed = await confirmDialog(t.upgradeConfirmMessage, {
+        title: t.upgradeConfirmTitle,
+        kind: "warning",
+        okLabel: t.upgradeConfirmAction,
+        cancelLabel: t.cancel,
+      });
+      if (!confirmed) return;
+    }
     setExternalInstallBusy(true);
     setSettingsOpen(true);
     try {
